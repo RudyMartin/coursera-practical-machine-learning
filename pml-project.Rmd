@@ -1,0 +1,206 @@
+---
+title: "Practical Machine Learning - Prediction Assignment"
+author: "Rudy Martin"
+date: "August 10, 2016"
+output: 
+  html_document: 
+    theme: flatly
+---
+
+Practical Machine Learning - Prediction Assignment
+
+This document describes an analysis done for the prediction assignment of the Coursera Practical Machine Learning Course from Johns Hopkins University. 
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These IoT devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+In this project, our goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants and to predict a quality of activity grade.
+
+The data for this project comes from this source: http://groupware.les.inf.puc-rio.br/har. 
+
+Before beginning the project, be sure to load the required R libraries and set any environmental variables
+
+```{r}
+# Clear environment of prior calculations. For best results always create/use an R project to run this.
+  rm(list=ls())
+
+# SuppressMessages for presentation purposes. Your results may vary slightly based on versions installed.
+  suppressMessages(library(data.table))
+  suppressMessages(library(ggplot2))
+  suppressMessages(library(caret))
+  suppressMessages(library(knitr))
+  #suppressMessages(library(xtable))
+  suppressMessages(library(randomForest))
+  suppressMessages(library(e1071))
+  suppressMessages(library(doParallel))
+  
+  set.seed(583834) # For reproducible results always use a seed value. 
+```
+## 1. Load and Clean Data
+
+Load the csv file traing data and the 20 test cases that will be submitted to Coursera at the end.
+
+```{r}
+# Load the files. 
+  read.pml <- function(file) {
+    fread(file, na.strings=c("#DIV/0!", ""))
+  } 
+# uncomment these next two lines to load data on to your machine
+  # download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "pml-training.csv")
+  # download.file("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "pml-testing.csv")
+
+# This assumes you have successfully downloaded files to your local machine.
+  training <- read.pml("pml-training.csv")
+  testing <- read.pml("pml-testing.csv")
+  
+# A. Drop columns not wanted based on knowledge of dataset or research focus.
+  cols.dont.want <- training[,grep('^amplitude|^skewness|^kurtosis', x = names(training) )]
+  training <- subset(training, select=-cols.dont.want)
+  
+# B. Drop all NA/nearly blank columns (assuming neglible cleaning of raw data required).
+  na.cols <- training[,sapply(.SD, function(x) any(is.na(x)))]
+  
+# C. Drop id data (assuming no time-series introduced errors in collection or transmission of data).
+  drop.id_columns <- function(x) {
+    x[,!c("V1","user_name","raw_timestamp_part_1",
+          "raw_timestamp_part_2","cvtd_timestamp","new_window","num_window"),with=F]
+  }
+  training <- drop.id_columns(training[,eval(names(which(na.cols == F))),with=F])
+  
+# D. Drop near zero variace predictors (assumes we pre-tested removal of only zero variance data).
+  nzv95.cols <- nearZeroVar(training, freqCut = 95/5, saveMetrics = FALSE)
+  training <- subset(training, select=-nzv95.cols)
+  
+# Reconcile structure as prediction data to test structure
+  Tx <- training[,!"classe",with=F]
+  testing <- subset(testing, select=names(Tx))
+  dim(training) # Print out dimensions to check these are consistent with one difference.
+  dim(testing) # Test set excludes the class score; it has one less column than testing.
+```
+The initial set starts with an overly generous 160 columns and 19622 observation. This is much more data than is required for a quick analysis. To streamline this process, selected columns are dropped to:
+
+a) exclude useless derivative data collected, 
+b) filter out all NA columns, assuming neglible cleaning of raw data required,
+c) eliminate the first 7 columns which are data entry-related, and
+d) cut out near-zero variance columns, which in our preliminary model runs were also not of much predictive value.
+
+Finally the test and prediction datastructures are reconciled to include all the same dependent features. The training set includes the class score which is the factor we will predict.
+
+## 2. Exploratory Data Analysis
+
+The data munging tasks cut the datasets down to a mere 53 variables. For tuning the parameters further, a Principal Component Analysis (PCA) might be useful.
+
+
+```{r}
+  pca.obj <- prcomp(data.matrix(training[, 1:53]), center=T, scale=T)
+  summary(pca.obj)
+  preProc <- preProcess(training, method='pca', thresh=0.95, outcome=training$classe)
+  # preProc$rotation
+  
+# It looks like 25 components account for 95% of the variance
+  topN <- 25
+  load.rot <- preProc$rotation # View(load.rot)
+  pcaFactors <- names(load.rot[1:topN,1])
+  pcaFactors
+```
+
+Indeed, it looks like the first 25 components account for 95% of the variance, which suggests that automated PCA preprocessing would be valuable. In our preliminary runs, the training and test sets were further reduced to these 25 primary features, with minimal loss of predictive fidelity. However, for the base case illustration here the datasets will not reduced further before testing alternative predictive models.
+
+The goal of the final model is to accurately predict activity grades (A-E) with high certainty. Since the independent Y value is neither a single number, nor a binary yes/no decision, this is not a regression problem but a classification one. Note this assumes that the grading outcome is not produced on a numeric basis and then converted to a grade/grouping, a common feature found in many scoring applications, like credit scores. So we proceed to select an algorithm that generates multiple classes as the predicted outcome value.
+
+
+## 3. Model Selection
+
+### The k-Nearest Neighbours (kNN) Model
+
+Our first model tested is a popular fuzzy clasification approach, the k-Nearest Neighbours(kNN). This is a supervised machine learning algorithm where the destination is known but the path to the end destination is not.
+    
+For further processing, the initial training dataset is further split tnto training (trc.tr, 70%) and testing set (trc.ts, 30%) sets, and the out of sample error estimated.  The kNN model is subject to a 10-fold cross-validation.
+
+
+```{r}
+# A normal split might be 70% training / 15% testing / 15% validation-prediction.
+# Since prediction set is broken out we will use 30% for out-of-sample testing
+  trn.idx <- createDataPartition(training$classe, p=0.7, list=FALSE)
+  trc.tr <- training[trn.idx, ] # training
+  trc.ts <- training[-trn.idx, ] # testing-and-validation-combined
+  
+# Run the knn model using PCA preprocesing and trainControl which specifies the type of resampling.
+  model.knn <- train(classe ~ ., trc.tr, method="knn", preProcess=c("pca"), metric="Accuracy",
+                   trControl = trainControl(method = "cv", number=10))
+  pred.knn <- predict(model.knn, newdata=trc.ts)
+  model.knn.oos.error <- sum(predict(model.knn, newdata=trc.ts) == trc.ts$classe)/nrow(trc.ts)
+  model.knn.oos.error # error resulted from applying the prediction algorithm to a new data set
+  
+  # model.knn
+  confusionMatrix(pred.knn,trc.ts$classe)
+  
+```
+
+Both the Overall Accuracy (0.95) and the Kappa statistic (0.94) which takes into consideration observed accuracy and the expected error rate, indicate this is a fairly good model for predicting grades. However, given our expectation of finding a model with a nearly perfect fit, we continue with an alternative approach.
+
+
+### Random Forests Model
+
+Random forests are very good in that it is an ensemble learning method used for classification and regression.  This technique uses multiple models for better performance that just using a single tree model. 
+
+One down side to using Random forests is that calculation on a laptop may require a significant wait for completion. So, for quicker processing let's use the foreach and doParallel packages. In this example, we will call registerDoParallel to instantiate the configuration. 
+
+```{r}
+# alternative traincontrol settings
+trCtrl <- trainControl(method = "repeatedcv", number = 2, repeats = 5, allowParallel = TRUE)
+trCtrl_none <- trainControl(method="none")
+
+# This creates parallel process. Note that this is machine-specfic and may not work on all setups.
+cl <- makePSOCKcluster(2)
+# clusterEvalQ(cl, library(foreach)) # check cluster
+registerDoParallel(cl)
+
+# Build Random forest with parRF method
+model.rf <- train(y=as.factor(trc.tr$classe), x = trc.tr[ ,! "classe", with = F], tuneGrid=data.frame(mtry=3), trControl=trCtrl, method="parRF")
+pred.rf <- predict(model.rf, newdata=trc.ts, method="parRF")
+model.rf.oos.error <- sum(predict(model.rf, newdata=trc.ts, method="parRF") == trc.ts$classe)/nrow(trc.ts)
+model.rf.oos.error # error resulted from applying the prediction algorithm to a new data set
+
+# model.rf
+confusionMatrix(pred.rf,trc.ts$classe)
+
+```
+
+
+The results of the confusion matrix from the Random forests training model show the model's out-of-sample overall accuracy is over 99%, and therefore an overall error rate of less than 1%. This is our preferred model for this assignment.
+
+
+## 4. Prediction
+
+Now apply the selected Randon forests model to the validation set to predict the 20 final grades.
+
+```{r}
+
+
+valid.rf <- predict(model.rf, newdata=testing, method="parRF")
+valid.rf
+
+```
+
+
+## 5. Submit Assignment
+
+
+```{r}
+
+pml_write_files = function(x){
+    n = length(x)
+    for(i in 1:n){
+        filename = paste0("problem_id_",i,".txt")
+        write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+    }
+}
+pml_write_files(valid.rf)
+```
+
+Congratulations!! Results scored 100% (20/20) on the Course Project Submission
+
+GitHub repo: https://github.com/RudyMartin/coursera-practical-machine-learning
+
+The HTML file is in the gh-pages branch.
+The R markdown file (Rmd) is in the master branch. 
